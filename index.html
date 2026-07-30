@@ -44,6 +44,13 @@
         .dx-input:focus { border-color: #3498db; }
         .btn-danger { background-color: #e74c3c; color: white; padding: 8px 15px; font-size: 14px; }
         .btn-danger:hover { background-color: #c0392b; }
+        .btn-add { background-color: #16a085; color: white; padding: 9px 18px; font-size: 14px; }
+        .btn-add:hover { background-color: #138a72; }
+        .btn-undo { background-color: #f39c12; }
+        .btn-undo:hover { background-color: #d68910; }
+        .btn-undo:disabled { background-color: #bdc3c7; }
+        .add-row-tr td { background-color: #fafafa; padding: 10px; }
+        .new-row-tr td { background-color: #fffdf3; }
         .sync-badge { position: fixed; bottom: 20px; right: 20px; padding: 10px 20px; background: #f39c12; color: white; border-radius: 50px; display: none; z-index: 1000; box-shadow: 0 4px 6px rgba(0,0,0,0.2); font-weight: bold; font-size: 14px;}
         
         /* Pengaturan Cetak (Print) */
@@ -146,6 +153,9 @@
         <div class="action-group">
             <button class="btn btn-primary" id="loadBtn" onclick="loadICD10()">
                 Muat Terminologi ICD-10 🌐
+            </button>
+            <button class="btn btn-undo" id="undoBtn" onclick="undoLastAction()" disabled title="Kembalikan perubahan terakhir">
+                ↩️ Undo
             </button>
             <button class="btn btn-success" onclick="window.print()">
                 Cetak / PDF 🖨️
@@ -6543,11 +6553,234 @@
     }
 
     // === 4. FUNGSI PEMBUATAN STRUKTUR CRUD TABEL ===
+
+    // --- State untuk fitur Tambah Baris (+) & Undo ---
+    // PENTING: rowId baris statis TETAP memakai pola lama (row_{room}_{index})
+    // agar data yang sudah tersimpan di Google Sheet tidak pernah hilang saat
+    // script ini diperbarui & di-deploy ulang. Baris baru (+) memakai prefix
+    // "new_" dan menitipkan datanya (kode/terminologi/jumlah) sebagai JSON di
+    // dalam field "dxKlinis" yang sudah ada, sehingga backend Apps Script yang
+    // lama TIDAK PERLU diubah sama sekali.
+    let actionHistory = [];
+    let newRowSeq = 0;
+
+    function escapeHtml(str) {
+        return String(str ?? '').replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+
+    function updateUndoButtonState() {
+        const btn = document.getElementById('undoBtn');
+        if (btn) btn.disabled = actionHistory.length === 0;
+    }
+
+    function pushHistory(entry) {
+        actionHistory.push(entry);
+        if (actionHistory.length > 30) actionHistory.shift();
+        updateUndoButtonState();
+    }
+
+    // Ambil nilai seluruh kolom yang bisa diedit pada satu baris
+    function captureRowState(row) {
+        const val = sel => { const el = row.querySelector(sel); return el ? el.value : undefined; };
+        return {
+            kode: val('.val-kode'),
+            terminologi: val('.val-term'),
+            jumlah: val('.val-jumlah'),
+            dx: val('.val-dx'),
+            alasan: val('.val-alasan')
+        };
+    }
+
+    // Simpan kondisi "sebelum diubah" saat input pertama kali difokus,
+    // supaya bisa dikembalikan lewat tombol Undo.
+    function captureBaseline(inputEl) {
+        const row = inputEl.closest('tr');
+        if (row.dataset.captured !== 'pending') {
+            row.dataset.prevState = JSON.stringify(captureRowState(row));
+            row.dataset.captured = 'pending';
+        }
+    }
+
+    // Kirim kondisi terkini satu baris ke server, memakai kontrak lama
+    // (rowId, dxKlinis, alasan, isDeleted) supaya kompatibel dengan backend yang ada.
+    function pushRowStateToServer(row, rowId, state) {
+        state = state || captureRowState(row);
+        let dxPayload, alasanPayload;
+        if (rowId.startsWith('new_')) {
+            dxPayload = JSON.stringify({
+                kode: state.kode || '',
+                terminologi: state.terminologi || '',
+                jumlah: state.jumlah || '',
+                dx: state.dx || ''
+            });
+            alasanPayload = state.alasan || '';
+        } else {
+            dxPayload = state.dx || '';
+            alasanPayload = state.alasan || '';
+        }
+        const isDeleted = row.style.display === 'none' ? 'true' : 'false';
+        syncToServer(rowId, dxPayload, alasanPayload, isDeleted);
+    }
+
+    // Handler Trigger Onchange Input (dipakai baris statis maupun baris baru)
+    function handleRowChange(inputEl, rowId) {
+        const row = inputEl.closest('tr');
+        const newState = captureRowState(row);
+        let prevState = newState;
+        if (row.dataset.prevState) {
+            try { prevState = JSON.parse(row.dataset.prevState); } catch (e) { /* abaikan */ }
+        }
+        if (JSON.stringify(newState) !== JSON.stringify(prevState)) {
+            pushHistory({ type: 'edit', rowId, prevState });
+        }
+        row.dataset.captured = '';
+        pushRowStateToServer(row, rowId, newState);
+    }
+
+    // Handler Trigger Tombol Hapus (dipakai baris statis maupun baris baru)
+    function deleteRowData(btn, rowId) {
+        if (confirm('Apakah Anda yakin ingin menghapus data laporan di baris ini?')) {
+            const row = btn.closest('tr');
+            const prevState = captureRowState(row);
+            pushHistory({ type: 'delete', rowId, prevState });
+            row.style.display = 'none'; // Animasi instan di browser
+            pushRowStateToServer(row, rowId, prevState); // Push perintah hapus ke database
+            showStatus('🗑️ Baris dihapus', '#e74c3c', 2000);
+        }
+    }
+
+    // Nomor ulang khusus baris baru (baris statis tidak pernah diubah nomornya)
+    function renumberNewRows(tbody) {
+        let maxNo = 0;
+        tbody.querySelectorAll('tr').forEach(tr => {
+            if (tr.classList.contains('new-row-tr') || tr.classList.contains('add-row-tr')) return;
+            const n = parseInt((tr.cells[0] && tr.cells[0].innerText || '').trim(), 10);
+            if (!isNaN(n) && n > maxNo) maxNo = n;
+        });
+        let counter = maxNo;
+        tbody.querySelectorAll('tr.new-row-tr').forEach(tr => {
+            if (tr.style.display === 'none') return;
+            counter++;
+            tr.cells[0].innerText = counter;
+        });
+    }
+
+    // Bangun elemen <tr> untuk baris diagnosa baru (kode/terminologi/jumlah bisa diisi manual)
+    function buildEditableRowElement(rowId, data) {
+        const tr = document.createElement('tr');
+        tr.className = 'new-row-tr';
+        tr.setAttribute('data-row-id', rowId);
+        tr.innerHTML = `
+            <td class="row-no">-</td>
+            <td><input type="text" class="dx-input val-kode" value="${escapeHtml(data.kode)}" placeholder="Kode ICD-10" onfocus="captureBaseline(this)" onchange="handleRowChange(this, '${rowId}')"></td>
+            <td><input type="text" class="dx-input val-term" value="${escapeHtml(data.terminologi)}" placeholder="Terminologi ICD-10" onfocus="captureBaseline(this)" onchange="handleRowChange(this, '${rowId}')"></td>
+            <td class="count-col"><input type="number" class="dx-input val-jumlah" style="text-align:center" value="${escapeHtml(data.jumlah)}" placeholder="0" onfocus="captureBaseline(this)" onchange="handleRowChange(this, '${rowId}')"></td>
+            <td><input type="text" class="dx-input val-dx" value="${escapeHtml(data.dx)}" placeholder="Input Dx..." onfocus="captureBaseline(this)" onchange="handleRowChange(this, '${rowId}')"></td>
+            <td><input type="text" class="dx-input val-alasan" value="${escapeHtml(data.alasan)}" placeholder="Alasan..." onfocus="captureBaseline(this)" onchange="handleRowChange(this, '${rowId}')"></td>
+            <td class="no-print" style="text-align:center"><button class="btn btn-danger" onclick="deleteRowData(this, '${rowId}')">Hapus</button></td>
+        `;
+        return tr;
+    }
+
+    // Pastikan ada baris tombol "+" di baris paling bawah tabel tiap ruangan
+    function ensureAddRowButton(roomName, tbody) {
+        if (tbody.querySelector('.add-row-tr')) return;
+        const tr = document.createElement('tr');
+        tr.className = 'add-row-tr no-print';
+        const td = document.createElement('td');
+        td.colSpan = 7;
+        td.style.textAlign = 'center';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-add';
+        btn.innerHTML = '+ Tambah Diagnosa';
+        btn.addEventListener('click', () => addNewDiagnosaRow(roomName));
+        td.appendChild(btn);
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+    }
+
+    // Handler tombol "+" : menambahkan baris diagnosa baru di ruangan terkait
+    function addNewDiagnosaRow(roomName) {
+        const rooms = document.querySelectorAll('.room-container');
+        let container = null;
+        rooms.forEach(r => { if (r.getAttribute('data-room') === roomName) container = r; });
+        if (!container) return;
+
+        const tbody = container.querySelector('tbody');
+        const addRowTr = tbody.querySelector('.add-row-tr');
+        const safeRoom = roomName.replace(/[^a-zA-Z0-9]/g, '_');
+        newRowSeq++;
+        const rowId = `new_${safeRoom}_${Date.now()}_${newRowSeq}`;
+
+        const tr = buildEditableRowElement(rowId, { kode: '', terminologi: '', jumlah: '', dx: '', alasan: '' });
+        if (addRowTr) {
+            tbody.insertBefore(tr, addRowTr);
+        } else {
+            tbody.appendChild(tr);
+        }
+
+        renumberNewRows(tbody);
+        pushHistory({ type: 'create', rowId });
+        showStatus('➕ Baris diagnosa baru ditambahkan', '#3498db', 1500);
+
+        const kodeInput = tr.querySelector('.val-kode');
+        if (kodeInput) kodeInput.focus();
+    }
+
+    // Handler tombol Undo global (mengembalikan aksi terakhir: edit / hapus / tambah baris)
+    function undoLastAction() {
+        if (actionHistory.length === 0) return;
+        const action = actionHistory.pop();
+        updateUndoButtonState();
+
+        if (action.type === 'create') {
+            const row = document.querySelector(`tr[data-row-id="${action.rowId}"]`);
+            if (row) {
+                const tbody = row.closest('tbody');
+                row.remove();
+                if (tbody) renumberNewRows(tbody);
+            }
+            syncToServer(action.rowId, '', '', 'true'); // Pastikan tidak muncul lagi setelah reload
+            showStatus('↩️ Baris baru dibatalkan', '#f39c12', 2000);
+            return;
+        }
+
+        const row = document.querySelector(`tr[data-row-id="${action.rowId}"]`);
+        if (!row) {
+            showStatus('⚠️ Baris tidak ditemukan untuk di-undo', '#e74c3c', 2000);
+            return;
+        }
+
+        if (action.type === 'delete') {
+            row.style.display = '';
+        }
+
+        const st = action.prevState || {};
+        const setVal = (sel, v) => { const el = row.querySelector(sel); if (el && v !== undefined) el.value = v; };
+        setVal('.val-kode', st.kode);
+        setVal('.val-term', st.terminologi);
+        setVal('.val-jumlah', st.jumlah);
+        setVal('.val-dx', st.dx);
+        setVal('.val-alasan', st.alasan);
+
+        row.dataset.captured = '';
+        row.dataset.prevState = '';
+        pushRowStateToServer(row, action.rowId, st);
+
+        const tbody = row.closest('tbody');
+        if (tbody) renumberNewRows(tbody);
+        showStatus('↩️ Perubahan terakhir dibatalkan', '#f39c12', 2000);
+    }
+
     function renderTableCRUD(serverData) {
         const rooms = document.querySelectorAll('.room-container');
         
         rooms.forEach((room) => {
             const roomName = room.getAttribute('data-room');
+            const safeRoom = roomName.replace(/[^a-zA-Z0-9]/g, '_');
             const table = room.querySelector('table');
             const theadTr = table.querySelector('thead tr');
             
@@ -6569,8 +6802,9 @@
             const rows = tbody.querySelectorAll('tr');
 
             rows.forEach((row, rowIndex) => {
-                // Buat primary key unik
-                const rowId = `row_${roomName.replace(/[^a-zA-Z0-9]/g, '_')}_${rowIndex}`;
+                // Buat primary key unik (TIDAK BOLEH DIUBAH agar data lama tetap terbaca)
+                const rowId = `row_${safeRoom}_${rowIndex}`;
+                row.setAttribute('data-row-id', rowId);
                 const dataRow = serverData[rowId] || { dxKlinis: '', alasan: '', isDeleted: 'false' };
                 
                 // Hide row jika status = deleted
@@ -6582,13 +6816,13 @@
                 // Inject Input Dx Klinis
                 const dxCell = row.cells[4];
                 if (dxCell && !dxCell.querySelector('input')) {
-                    dxCell.innerHTML = `<input type="text" class="dx-input val-dx" value="${dataRow.dxKlinis}" onchange="triggerUpdate(this, '${rowId}')" placeholder="Input Dx...">`;
+                    dxCell.innerHTML = `<input type="text" class="dx-input val-dx" value="${escapeHtml(dataRow.dxKlinis)}" onfocus="captureBaseline(this)" onchange="handleRowChange(this, '${rowId}')" placeholder="Input Dx...">`;
                 }
 
                 // Inject Col Alasan & Col Aksi Hapus
                 if (row.cells.length === 5) {
                     const cellAlasan = document.createElement('td');
-                    cellAlasan.innerHTML = `<input type="text" class="dx-input val-alasan" value="${dataRow.alasan}" onchange="triggerUpdate(this, '${rowId}')" placeholder="Alasan...">`;
+                    cellAlasan.innerHTML = `<input type="text" class="dx-input val-alasan" value="${escapeHtml(dataRow.alasan)}" onfocus="captureBaseline(this)" onchange="handleRowChange(this, '${rowId}')" placeholder="Alasan...">`;
                     row.appendChild(cellAlasan);
 
                     const cellAksi = document.createElement('td');
@@ -6598,27 +6832,37 @@
                     row.appendChild(cellAksi);
                 }
             });
+
+            // Render ulang baris-baris baru (hasil tombol +) yang sudah pernah tersimpan di server
+            const prefix = `new_${safeRoom}_`;
+            const newRowIds = Object.keys(serverData).filter(id => id.startsWith(prefix));
+            newRowIds.sort((a, b) => {
+                const sa = a.slice(prefix.length).split('_').map(Number);
+                const sb = b.slice(prefix.length).split('_').map(Number);
+                return (sa[0] - sb[0]) || (sa[1] - sb[1]);
+            });
+            newRowIds.forEach(rowId => {
+                const rec = serverData[rowId];
+                if (!rec) return;
+                if (rec.isDeleted === 'true' || rec.isDeleted === true) return;
+                let parsed = { kode: '', terminologi: '', jumlah: '', dx: '' };
+                try {
+                    const decoded = JSON.parse(rec.dxKlinis);
+                    if (decoded && typeof decoded === 'object') parsed = Object.assign(parsed, decoded);
+                } catch (e) {
+                    parsed.dx = rec.dxKlinis || '';
+                }
+                const tr = buildEditableRowElement(rowId, {
+                    kode: parsed.kode, terminologi: parsed.terminologi, jumlah: parsed.jumlah,
+                    dx: parsed.dx, alasan: rec.alasan || ''
+                });
+                tbody.appendChild(tr);
+            });
+
+            // Tombol "+" selalu ditempatkan di baris paling bawah tabel
+            ensureAddRowButton(roomName, tbody);
+            renumberNewRows(tbody);
         });
-    }
-
-    // Handler Trigger Onchange Input
-    function triggerUpdate(inputEl, rowId) {
-        const row = inputEl.closest('tr');
-        const valDx = row.querySelector('.val-dx').value;
-        const valAlasan = row.querySelector('.val-alasan').value;
-        syncToServer(rowId, valDx, valAlasan, 'false');
-    }
-
-    // Handler Trigger Tombol Hapus
-    function deleteRowData(btn, rowId) {
-        if(confirm('Apakah Anda yakin ingin menghapus data laporan di baris ini?')) {
-            const row = btn.closest('tr');
-            row.style.display = 'none'; // Animasi instan di browser
-            
-            const valDx = row.querySelector('.val-dx').value;
-            const valAlasan = row.querySelector('.val-alasan').value;
-            syncToServer(rowId, valDx, valAlasan, 'true'); // Push perintah hapus ke database
-        }
     }
 
     // === 5. FUNGSI FILTER & LOAD ICD-10 (Bawaan Anda) ===
